@@ -114,9 +114,12 @@ async fn login_with_proxy_support(
     client_id: &str,
     client_secret: &str,
     scopes: &[String],
+    callback_port: u16,
 ) -> Result<(String, String), GwsError> {
-    // Start local server to receive OAuth callback
-    let listener = TcpListener::bind("127.0.0.1:0")
+    // Start local server to receive OAuth callback.
+    // Bind to all interfaces so port-forwarding works in Docker/CI environments.
+    let host = if callback_port == 0 { "127.0.0.1" } else { "0.0.0.0" };
+    let listener = TcpListener::bind(format!("{host}:{callback_port}"))
         .map_err(|e| GwsError::Auth(format!("Failed to start local server: {e}")))?;
     let port = listener
         .local_addr()
@@ -392,6 +395,15 @@ fn build_login_subcommand() -> clap::Command {
                 )
                 .value_name("services"),
         )
+        .arg(
+            clap::Arg::new("callback-port")
+                .long("callback-port")
+                .env("GOOGLE_WORKSPACE_CLI_CALLBACK_PORT")
+                .help("Port for the local OAuth callback server (0 = OS-assigned)")
+                .value_name("PORT")
+                .value_parser(clap::value_parser!(u16))
+                .default_value("0"),
+        )
 }
 
 /// Build the clap Command for `gws auth`.
@@ -448,9 +460,10 @@ pub async fn handle_auth_command(args: &[String]) -> Result<(), GwsError> {
 
     match matches.subcommand() {
         Some(("login", sub_m)) => {
-            let (scope_mode, services_filter) = parse_login_args(sub_m);
+            let (scope_mode, services_filter, callback_port) =
+                parse_login_args(sub_m);
 
-            handle_login_inner(scope_mode, services_filter).await
+            handle_login_inner(scope_mode, services_filter, callback_port).await
         }
         Some(("setup", sub_m)) => {
             // Collect remaining args and delegate to setup's own clap parser.
@@ -482,8 +495,10 @@ fn login_command() -> clap::Command {
     build_login_subcommand()
 }
 
-/// Extract `ScopeMode` and optional services filter from parsed login args.
-fn parse_login_args(matches: &clap::ArgMatches) -> (ScopeMode, Option<HashSet<String>>) {
+/// Extract `ScopeMode`, optional services filter, and OAuth callback port from parsed login args.
+fn parse_login_args(
+    matches: &clap::ArgMatches,
+) -> (ScopeMode, Option<HashSet<String>>, u16) {
     let scope_mode = if let Some(scopes_str) = matches.get_one::<String>("scopes") {
         ScopeMode::Custom(
             scopes_str
@@ -508,7 +523,11 @@ fn parse_login_args(matches: &clap::ArgMatches) -> (ScopeMode, Option<HashSet<St
             .collect()
     });
 
-    (scope_mode, services_filter)
+    let callback_port = *matches
+        .get_one::<u16>("callback-port")
+        .expect("callback-port has a default_value and is always present");
+
+    (scope_mode, services_filter, callback_port)
 }
 
 /// Run the `auth login` flow.
@@ -532,9 +551,9 @@ pub async fn run_login(args: &[String]) -> Result<(), GwsError> {
         Err(e) => return Err(GwsError::Validation(e.to_string())),
     };
 
-    let (scope_mode, services_filter) = parse_login_args(&matches);
+    let (scope_mode, services_filter, callback_port) = parse_login_args(&matches);
 
-    handle_login_inner(scope_mode, services_filter).await
+    handle_login_inner(scope_mode, services_filter, callback_port).await
 }
 /// Custom delegate that prints the OAuth URL on its own line for easy copying.
 /// Optionally includes `login_hint` in the URL for account pre-selection.
@@ -576,6 +595,7 @@ impl yup_oauth2::authenticator_delegate::InstalledFlowDelegate for CliFlowDelega
 async fn handle_login_inner(
     scope_mode: ScopeMode,
     services_filter: Option<HashSet<String>>,
+    callback_port: u16,
 ) -> Result<(), GwsError> {
     // Resolve client_id and client_secret:
     // 1. Env vars (highest priority)
@@ -618,13 +638,21 @@ async fn handle_login_inner(
     std::fs::create_dir_all(&config)
         .map_err(|e| GwsError::Validation(format!("Failed to create config directory: {e}")))?;
 
-    // If proxy env vars are set, use proxy-aware OAuth flow (reqwest)
-    // Otherwise use yup-oauth2 (faster, but doesn't support proxy)
-    let (access_token, refresh_token) = if crate::auth::has_proxy_env() {
-        login_with_proxy_support(&client_id, &client_secret, &scopes).await?
-    } else {
-        login_with_yup_oauth(&config, &client_id, &client_secret, &scopes).await?
-    };
+    // If proxy env vars are set, or a custom callback port is requested,
+    // use proxy-aware OAuth flow (reqwest). Otherwise use yup-oauth2 (faster,
+    // but doesn't support proxy or custom callback configuration).
+    let (access_token, refresh_token) =
+        if crate::auth::has_proxy_env() || callback_port != 0 {
+            login_with_proxy_support(
+                &client_id,
+                &client_secret,
+                &scopes,
+                callback_port,
+            )
+            .await?
+        } else {
+            login_with_yup_oauth(&config, &client_id, &client_secret, &scopes).await?
+        };
 
     // Build credentials in the standard authorized_user format
     let creds_json = json!({
@@ -2531,5 +2559,60 @@ mod tests {
 
         let err = read_refresh_token_from_cache(file.path()).unwrap_err();
         assert!(err.to_string().contains("no refresh token was returned"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn parse_login_args_defaults_callback_port() {
+        unsafe {
+            std::env::remove_var("GOOGLE_WORKSPACE_CLI_CALLBACK_PORT");
+        }
+        let matches = build_login_subcommand()
+            .try_get_matches_from(["login"])
+            .unwrap();
+        let (_, _, callback_port) = parse_login_args(&matches);
+        assert_eq!(callback_port, 0);
+    }
+
+    #[test]
+    fn parse_login_args_custom_callback_port() {
+        let matches = build_login_subcommand()
+            .try_get_matches_from(["login", "--callback-port", "9090"])
+            .unwrap();
+        let (_, _, callback_port) = parse_login_args(&matches);
+        assert_eq!(callback_port, 9090u16);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn parse_login_args_callback_port_from_env() {
+        unsafe {
+            std::env::set_var("GOOGLE_WORKSPACE_CLI_CALLBACK_PORT", "8888");
+        }
+        let matches = build_login_subcommand()
+            .try_get_matches_from(["login"])
+            .unwrap();
+        let (_, _, callback_port) = parse_login_args(&matches);
+        unsafe {
+            std::env::remove_var("GOOGLE_WORKSPACE_CLI_CALLBACK_PORT");
+        }
+        assert_eq!(callback_port, 8888u16);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn parse_login_args_cli_arg_overrides_env_for_callback() {
+        // CLI arg takes precedence even when env var is set
+        unsafe {
+            std::env::set_var("GOOGLE_WORKSPACE_CLI_CALLBACK_PORT", "7777");
+        }
+        let matches = build_login_subcommand()
+            .try_get_matches_from(["login", "--callback-port", "5555"])
+            .unwrap();
+        let (_, _, callback_port) = parse_login_args(&matches);
+        unsafe {
+            std::env::remove_var("GOOGLE_WORKSPACE_CLI_CALLBACK_PORT");
+        }
+        assert_eq!(callback_port, 5555u16);
     }
 }
